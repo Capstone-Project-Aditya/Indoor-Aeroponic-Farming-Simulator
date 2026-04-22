@@ -89,7 +89,7 @@ serve(async (req) => {
     const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
     if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not configured");
 
-    const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-1.5-flash";
+
 
     // Build context from simulation history
     let historyContext = "";
@@ -133,149 +133,54 @@ Use Indian Rupees (₹) for all monetary values. Be specific with numbers.`;
 
     const userPrompt = `Give me an optimal crop recommendation for growing "${crop_key}" in an indoor aeroponic system. Include specific environment settings, expected economics, and actionable tips.${historyContext}`;
 
-    const payload = {
-      systemInstruction: {
-        parts: [{ text: systemPrompt }],
-      },
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: userPrompt }],
-        },
-      ],
-      generationConfig: {
-        temperature: 0.6,
-        topP: 0.9,
-        maxOutputTokens: 1200,
-      },
-    };
+    const finalPrompt = `${systemPrompt}\n\nUser Request: ${userPrompt}`;
 
-    // Google has changed Gemini REST endpoints and available model IDs over time.
-    // We try:
-    // - API versions: v1beta then v1
-    // - Model IDs: configured model first, then common fallbacks
-    const candidateModels = Array.from(
-      new Set(
-        [
-          GEMINI_MODEL,
-          "gemini-1.5-flash",
-          "gemini-1.5-flash-latest",
-          "gemini-1.5-pro",
-          "gemini-1.5-pro-latest",
-        ].filter(Boolean)
-      )
+    // Use the exact same approach as the working gemini/index.ts function
+    const response = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: finalPrompt }] }],
+        }),
+      }
     );
 
-    const buildUrls = (model: string) => [
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`,
-      `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`,
-    ];
+    const data = await response.json();
+    console.log("Gemini status:", response.status);
 
-    let response: Response | null = null;
-    let lastText: string | null = null;
-    let lastStatus: number | null = null;
-    let modelUsed: string | null = null;
+    if (!response.ok || data.error) {
+      const errMsg = data?.error?.message || JSON.stringify(data?.error) || "Unknown Gemini error";
+      console.error("Gemini API error:", response.status, errMsg);
 
-    outer: for (const model of candidateModels) {
-      for (const url of buildUrls(model)) {
-        const r = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(payload),
-        });
-
-        if (r.ok) {
-          response = r;
-          modelUsed = model;
-          break outer;
-        }
-
-        const status = r.status;
-        const text = await r.text();
-        lastStatus = status;
-        lastText = text;
-
-        // If the endpoint or model isn't found on this API version, try the next.
-        if (status === 404) continue;
-
-        // Any other status (401/403/429/400/5xx) is not a "try next" situation.
-        response = new Response(text, {
-          status,
-          headers: r.headers,
-        });
-        modelUsed = model;
-        break outer;
-      }
-    }
-
-    if (!response) {
-      return new Response(
-        JSON.stringify({
-          error:
-            "Gemini API error: 404 (model or endpoint not found). Check GEMINI_MODEL and ensure the Generative Language API is enabled for your API key.",
-          tried_models: candidateModels,
-          last_status: lastStatus,
-          details: lastText ? lastText.slice(0, 800) : undefined,
-        }),
-        {
-          status: 500,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        }
-      );
-    }
-
-    if (!response.ok) {
-      const status = response.status;
-      const text = await response.text();
-      console.error("Gemini API error:", status, text ?? lastText);
-      
-      if (status === 429) {
-        return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
+      if (response.status === 429) {
+        return new Response(JSON.stringify({ error: "Rate limit exceeded. Please try again in a moment." }), {
           status: 429,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }
 
-      if (status === 400) {
-        return new Response(JSON.stringify({ error: "Bad request to Gemini API" }), {
-          status: 400,
+      return new Response(
+        JSON.stringify({ error: `Gemini API error: ${errMsg}` }),
+        {
+          status: response.status || 502,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      if (status === 404) {
-        return new Response(
-          JSON.stringify({
-            error:
-              "Gemini API returned 404 (model not found). Set GEMINI_MODEL to a valid model (for example: gemini-1.5-flash, gemini-1.5-flash-latest, gemini-1.5-pro) and redeploy.",
-          }),
-          {
-            status: 400,
-            headers: { ...corsHeaders, "Content-Type": "application/json" },
-          }
-        );
-      }
-
-      if (status === 401 || status === 403) {
-        return new Response(JSON.stringify({ error: "Gemini API key is invalid or missing permissions" }), {
-          status,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      throw new Error(`Gemini API error: ${status}`);
+        }
+      );
     }
 
-    const data = await response.json();
-    const recommendation =
-      data?.candidates?.[0]?.content?.parts
-        ?.map((p: any) => (typeof p?.text === "string" ? p.text : ""))
-        .join("")
-        .trim() || "Unable to generate recommendation.";
+    let recommendation = "Unable to generate recommendation.";
+    if (data.candidates?.length) {
+      recommendation = data.candidates[0].content.parts
+        .map((p: any) => p.text)
+        .join(" ");
+    }
 
-    return new Response(JSON.stringify({ recommendation, model_used: modelUsed ?? GEMINI_MODEL }), {
+    return new Response(JSON.stringify({ recommendation, model_used: "gemini-flash-latest" }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (e) {
